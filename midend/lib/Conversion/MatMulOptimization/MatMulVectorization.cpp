@@ -20,7 +20,11 @@
 
 #include <mlir/Dialect/Affine/IR/AffineOps.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
 #include <mlir/Dialect/Linalg/Transforms/Transforms.h>
+#include <mlir/IR/AffineExpr.h>
+#include <mlir/IR/AffineMap.h>
 #include <mlir/IR/Dialect.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/TypeUtilities.h>
@@ -40,11 +44,43 @@ using namespace vector;
 
 namespace {
 
+/// Return true if `genericOp` is a plain 2-D contraction with the canonical
+/// row-major layout the vectorization codegen below assumes: operands
+/// A(m, k), B(k, n) and accumulator C(m, n), iteration space (m, n, k) with a
+/// single m/n/k dimension and no batch.  Anything else (transposed operands,
+/// batched contractions, >2-D, reversed operand order) is rejected so it falls
+/// through to the generic linalg-to-loops lowering.
+static bool isStandardMatmulGeneric(linalg::GenericOp genericOp) {
+  auto linalgOp = cast<linalg::LinalgOp>(genericOp.getOperation());
+  if (!linalg::isaContractionOpInterface(linalgOp))
+    return false;
+  if (genericOp.getNumDpsInputs() != 2 || genericOp.getNumDpsInits() != 1)
+    return false;
+  if (linalgOp.getNumLoops() != 3)
+    return false;
+
+  FailureOr<linalg::ContractionDimensions> dims =
+      linalg::inferContractionDims(linalgOp);
+  if (failed(dims) || !dims->batch.empty() || dims->m.size() != 1 ||
+      dims->n.size() != 1 || dims->k.size() != 1)
+    return false;
+
+  MLIRContext *ctx = genericOp.getContext();
+  AffineExpr mExpr = getAffineDimExpr(dims->m[0], ctx);
+  AffineExpr nExpr = getAffineDimExpr(dims->n[0], ctx);
+  AffineExpr kExpr = getAffineDimExpr(dims->k[0], ctx);
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  return maps.size() == 3 &&
+         maps[0] == AffineMap::get(3, 0, {mExpr, kExpr}, ctx) &&
+         maps[1] == AffineMap::get(3, 0, {kExpr, nExpr}, ctx) &&
+         maps[2] == AffineMap::get(3, 0, {mExpr, nExpr}, ctx);
+}
+
 class MatMulVectorizationPattern : public ConversionPattern {
 public:
-  explicit MatMulVectorizationPattern(MLIRContext *context,
-                                      int64_t vecSizeParam, bool scalableParam)
-      : ConversionPattern(linalg::MatmulOp::getOperationName(), 1, context) {
+  MatMulVectorizationPattern(StringRef rootName, MLIRContext *context,
+                             int64_t vecSizeParam, bool scalableParam)
+      : ConversionPattern(rootName, 1, context) {
     vecSize = vecSizeParam;
     scalable = scalableParam;
   }
@@ -52,6 +88,13 @@ public:
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> /*operands*/,
                   ConversionPatternRewriter &rewriter) const override {
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+      if (!isStandardMatmulGeneric(genericOp))
+        return failure();
+    } else if (!isa<linalg::MatmulOp>(op)) {
+      return failure();
+    }
+
     auto loc = op->getLoc();
 
     // Create constant 0-7 values.
@@ -333,7 +376,10 @@ void MatMulVectorizationPass::runOnOperation() {
   bool isScalable = (vectorType == "scalable");
 
   RewritePatternSet patterns(context);
-  patterns.add<MatMulVectorizationPattern>(context, vecSize, isScalable);
+  patterns.add<MatMulVectorizationPattern>(
+      linalg::MatmulOp::getOperationName(), context, vecSize, isScalable);
+  patterns.add<MatMulVectorizationPattern>(
+      linalg::GenericOp::getOperationName(), context, vecSize, isScalable);
 
   if (failed(applyPartialConversion(module, target, std::move(patterns))))
     signalPassFailure();
